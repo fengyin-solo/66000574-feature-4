@@ -9,6 +9,10 @@ export interface VolumeData {
 
 export interface ROIResult {
   label: string; center: number[]; radius: number
-  mean: number; std: number; min: number; max: number; voxelCount: number
-  histogram: number[]
+  status: 'ok' | 'error'
+  error?: string
+  mean?: number; std?: number; min?: number; max?: number; voxelCount?: number
+  histogram?: number[]
 }
+
+export interface ROISummary { total: number; succeeded: number; failed: number }

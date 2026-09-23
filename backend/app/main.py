@@ -135,42 +135,81 @@ class ROIAnalyzeRequest(BaseModel):
     rois: list = []
 
 
+MIN_VOXELS = 8  # 有效体素数低于该值时统计不可靠，判定为"体素过少"
+
+
 @app.post("/api/roi")
 def analyze_roi(req: ROIAnalyzeRequest):
+    """批量ROI分析：每个区域独立测量并命名，单条失败只标记该条，不影响其余区域"""
     results = []
+
+    try:
+        vol = np.array(req.volume, dtype=np.float32)
+        d, h, w = vol.shape
+    except Exception:
+        vol = None
+
     for roi in req.rois:
         center = roi.get("center", [32, 32, 32])
         radius = roi.get("radius", 8)
         label = roi.get("label", "roi")
+        entry = {"label": label, "center": center, "radius": radius}
 
-        # Extract voxels within sphere
-        voxels = []
+        if vol is None:
+            results.append({**entry, "status": "error", "error": "体数据无效"})
+            continue
+
+        # 参数校验
         try:
-            vol = np.array(req.volume)
-            d, h, w = vol.shape
-            for z in range(max(0, center[2]-radius), min(d, center[2]+radius+1)):
-                for y in range(max(0, center[1]-radius), min(h, center[1]+radius+1)):
-                    for x in range(max(0, center[0]-radius), min(w, center[0]+radius+1)):
-                        if math.sqrt((x-center[0])**2 + (y-center[1])**2 + (z-center[2])**2) <= radius:
-                            voxels.append(float(vol[z, y, x]))
-        except:
-            voxels = []
+            cx, cy, cz = int(center[0]), int(center[1]), int(center[2])
+            r = int(radius)
+            if r < 0:
+                raise ValueError
+        except (TypeError, ValueError, IndexError):
+            results.append({**entry, "status": "error", "error": "ROI参数无效"})
+            continue
 
-        if voxels:
-            arr = np.array(voxels)
-            results.append({
-                "label": label,
-                "center": center,
-                "radius": radius,
-                "mean": round(float(np.mean(arr)), 2),
-                "std": round(float(np.std(arr)), 2),
-                "min": round(float(np.min(arr)), 2),
-                "max": round(float(np.max(arr)), 2),
-                "voxelCount": len(voxels),
-                "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
-            })
+        # 区域完全落在数据范围之外
+        if (cx + r < 0 or cx - r >= w or
+                cy + r < 0 or cy - r >= h or
+                cz + r < 0 or cz - r >= d):
+            results.append({**entry, "status": "error",
+                            "error": f"区域超出数据范围({w}×{h}×{d})"})
+            continue
 
-    return {"rois": results}
+        # Extract voxels within sphere（测量口径与单区域原有逻辑一致）
+        voxels = []
+        for z in range(max(0, cz-r), min(d, cz+r+1)):
+            for y in range(max(0, cy-r), min(h, cy+r+1)):
+                for x in range(max(0, cx-r), min(w, cx+r+1)):
+                    if math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) <= r:
+                        voxels.append(float(vol[z, y, x]))
+
+        if not voxels:
+            results.append({**entry, "status": "error", "error": "区域内无有效体素"})
+            continue
+        if len(voxels) < MIN_VOXELS:
+            results.append({**entry, "status": "error",
+                            "error": f"有效体素过少({len(voxels)}<{MIN_VOXELS})"})
+            continue
+
+        arr = np.array(voxels)
+        results.append({
+            **entry,
+            "status": "ok",
+            "mean": round(float(np.mean(arr)), 2),
+            "std": round(float(np.std(arr)), 2),
+            "min": round(float(np.min(arr)), 2),
+            "max": round(float(np.max(arr)), 2),
+            "voxelCount": len(voxels),
+            "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
+        })
+
+    failed = sum(1 for r in results if r.get("status") == "error")
+    return {
+        "rois": results,
+        "summary": {"total": len(results), "succeeded": len(results) - failed, "failed": failed}
+    }
 
 
 @app.get("/api/windows")
