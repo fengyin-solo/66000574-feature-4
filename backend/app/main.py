@@ -135,42 +135,114 @@ class ROIAnalyzeRequest(BaseModel):
     rois: list = []
 
 
+# Sphere ROIs with fewer than this many intersecting voxels cannot yield
+# meaningful statistics and are reported as failed.
+MIN_VOXEL_COUNT = 2
+
+
+def _coerce_int(value):
+    """Round numeric JSON values the same way float -> voxel index conversion did."""
+    return int(round(float(value)))
+
+
+def _analyze_single_roi(vol: np.ndarray, roi):
+    """Measure one spherical ROI.
+
+    Returns a dict whose success payload keeps the original measurement
+    contract (mean/std/min/max/voxelCount/histogram); failures return a
+    status="failed" record carrying a human-readable reason instead.
+    """
+    label = roi.get("label") or "roi"
+    center = roi.get("center", [32, 32, 32])
+    radius = roi.get("radius", 8)
+    roi_id = roi.get("id")
+
+    try:
+        if not isinstance(center, (list, tuple)) or len(center) != 3 or \
+                not all(isinstance(c, (int, float)) and math.isfinite(float(c)) for c in center):
+            raise ValueError("中心点必须为3个数值坐标")
+        cx, cy, cz = (_coerce_int(c) for c in center)
+    except (TypeError, ValueError):
+        return {"id": roi_id, "label": label, "center": center, "radius": radius,
+                "status": "failed", "reason": "中心点无效，必须为3个数值坐标"}
+
+    if not isinstance(radius, (int, float)) or not math.isfinite(float(radius)):
+        return {"id": roi_id, "label": label, "center": list(center), "radius": radius,
+                "status": "failed", "reason": "半径无效，必须为正数"}
+
+    r = _coerce_int(radius)
+    if r <= 0:
+        return {"id": roi_id, "label": label, "center": list(center), "radius": radius,
+                "status": "failed", "reason": "半径无效，必须为正数"}
+
+    d, h, w = vol.shape
+    if not (0 <= cx < w and 0 <= cy < h and 0 <= cz < d):
+        return {"id": roi_id, "label": label, "center": [cx, cy, cz], "radius": r,
+                "status": "failed",
+                "reason": f"中心({cx}, {cy}, {cz})在数据范围之外，数据尺寸为({w}, {h}, {d})"}
+
+    # Extract voxels within sphere
+    voxels = []
+    for z in range(max(0, cz-r), min(d, cz+r+1)):
+        for y in range(max(0, cy-r), min(h, cy+r+1)):
+            for x in range(max(0, cx-r), min(w, cx+r+1)):
+                if math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) <= r:
+                    voxels.append(float(vol[z, y, x]))
+
+    if len(voxels) == 0:
+        return {"id": roi_id, "label": label, "center": [cx, cy, cz], "radius": r,
+                "status": "failed", "reason": "球体与数据无交集，未取到任何体素"}
+    if len(voxels) < MIN_VOXEL_COUNT:
+        return {"id": roi_id, "label": label, "center": [cx, cy, cz], "radius": r,
+                "status": "failed",
+                "reason": f"体素数量仅{len(voxels)}个，少于最少要求{MIN_VOXEL_COUNT}个，无法统计"}
+
+    arr = np.array(voxels)
+    return {
+        "id": roi_id,
+        "label": label,
+        "center": [cx, cy, cz],
+        "radius": r,
+        "status": "ok",
+        "mean": round(float(np.mean(arr)), 2),
+        "std": round(float(np.std(arr)), 2),
+        "min": round(float(np.min(arr)), 2),
+        "max": round(float(np.max(arr)), 2),
+        "voxelCount": len(voxels),
+        "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
+    }
+
+
 @app.post("/api/roi")
 def analyze_roi(req: ROIAnalyzeRequest):
+    try:
+        vol = np.asarray(req.volume, dtype=np.float64)
+        if vol.ndim != 3:
+            raise ValueError("volume must be 3D")
+    except Exception:
+        # Volume-level failure: every requested row is marked failed.
+        rows = [{
+            "id": roi.get("id"), "label": roi.get("label") or "roi",
+            "center": roi.get("center"), "radius": roi.get("radius"),
+            "status": "failed", "reason": "体数据无法解析，请重新载入影像后再试"
+        } for roi in req.rois]
+        return {"rois": rows, "total": len(rows), "succeeded": 0, "failed": len(rows)}
+
     results = []
     for roi in req.rois:
-        center = roi.get("center", [32, 32, 32])
-        radius = roi.get("radius", 8)
-        label = roi.get("label", "roi")
-
-        # Extract voxels within sphere
-        voxels = []
+        # A malformed ROI definition must not abort the whole batch.
         try:
-            vol = np.array(req.volume)
-            d, h, w = vol.shape
-            for z in range(max(0, center[2]-radius), min(d, center[2]+radius+1)):
-                for y in range(max(0, center[1]-radius), min(h, center[1]+radius+1)):
-                    for x in range(max(0, center[0]-radius), min(w, center[0]+radius+1)):
-                        if math.sqrt((x-center[0])**2 + (y-center[1])**2 + (z-center[2])**2) <= radius:
-                            voxels.append(float(vol[z, y, x]))
-        except:
-            voxels = []
-
-        if voxels:
-            arr = np.array(voxels)
+            results.append(_analyze_single_roi(vol, roi))
+        except Exception as exc:
             results.append({
-                "label": label,
-                "center": center,
-                "radius": radius,
-                "mean": round(float(np.mean(arr)), 2),
-                "std": round(float(np.std(arr)), 2),
-                "min": round(float(np.min(arr)), 2),
-                "max": round(float(np.max(arr)), 2),
-                "voxelCount": len(voxels),
-                "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
+                "id": roi.get("id"), "label": roi.get("label") or "roi",
+                "center": roi.get("center"), "radius": roi.get("radius"),
+                "status": "failed", "reason": f"测量异常：{exc}"
             })
 
-    return {"rois": results}
+    succeeded = sum(1 for r in results if r.get("status") == "ok")
+    return {"rois": results, "total": len(results),
+            "succeeded": succeeded, "failed": len(results) - succeeded}
 
 
 @app.get("/api/windows")

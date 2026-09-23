@@ -8,7 +8,17 @@ export interface VolumeData {
 }
 
 export interface ROIResult {
+  id?: string | number
   label: string; center: number[]; radius: number
+  status: 'ok' | 'failed'
+  reason?: string
   mean: number; std: number; min: number; max: number; voxelCount: number
   histogram: number[]
+}
+
+export interface ROIAnalyzeResponse {
+  rois: ROIResult[]
+  total: number
+  succeeded: number
+  failed: number
 }
